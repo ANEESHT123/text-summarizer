@@ -1,3 +1,7 @@
-fastapi>=0.112.0,<0.113.0
-pydantic>=2.7.0,<3.0.0
-uvicorn==0.22.0
+transformers
+torch
+fastapi
+uvicorn
+pydantic
+PyPDF2
+python-docx
