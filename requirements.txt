@@ -1,7 +1,10 @@
-transformers
-torch
 fastapi
 uvicorn
-pydantic
 PyPDF2
 python-docx
+python-multipart
+langchain
+langchain-openai
+pydantic
+python-dotenv
+asyncio
