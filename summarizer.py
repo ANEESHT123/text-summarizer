@@ -1,7 +1,6 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from transformers import pipeline
 from contextlib import asynccontextmanager
 import logging
 import PyPDF2
@@ -9,25 +8,128 @@ import docx
 import io
 import os
 import mimetypes
-from typing import Optional
+import asyncio
+from typing import Optional, List, Tuple
 from fastapi.middleware.cors import CORSMiddleware
-
+from langchain_openai import ChatOpenAI
+from langchain.prompts import PromptTemplate
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from dotenv import load_dotenv
+load_dotenv()
 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-SUPPORTED_FORMATS = {
-    'application/pdf': '.pdf',
-    'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
-    'text/plain': '.txt',
-    'application/msword': '.docx'
-}
+MAX_CHUNKS = 5
+CHUNK_SIZE = 4000
+CHUNK_OVERLAP = 200
+REQUEST_TIMEOUT = 30  
+MAX_RETRIES = 2
+
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise ValueError("Missing OpenAI API key")
 
 class FileValidationError(Exception):
-    def __init__(self, detail: str):  
+    def __init__(self, detail: str):
         self.detail = detail
+
+def chunk_text(text: str) -> List[str]:
+    """Split text into chunks with a maximum number of chunks."""
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        length_function=len,
+        separators=["\n\n", "\n", ". ", " ", ""]
+    )
+    chunks = text_splitter.split_text(text)
+    
+  
+    if len(chunks) > MAX_CHUNKS:
+        
+        chunk_length = len(text) // MAX_CHUNKS
+        new_chunks = []
+        current_chunk = ""
+        
+        for chunk in chunks:
+            if len(current_chunk) + len(chunk) <= chunk_length:
+                current_chunk += chunk
+            else:
+                if current_chunk:
+                    new_chunks.append(current_chunk)
+                current_chunk = chunk
+                
+            if len(new_chunks) >= MAX_CHUNKS - 1:
+                break
+                
+        if current_chunk:
+            new_chunks.append(current_chunk)
+            
+        return new_chunks
+    
+    return chunks[:MAX_CHUNKS]
+
+async def summarize_with_timeout(text: str, llm, max_length: int) -> str:
+    """Summarize text with timeout."""
+    try:
+        prompt = PromptTemplate(
+            input_variables=["text", "max_length"],
+            template="Summarize the following text in {max_length} words. Focus on key points and maintain context:\n\n{text}"
+        )
+        chain = prompt | llm
+        
+        
+        result = await asyncio.wait_for(
+            asyncio.create_task(chain.ainvoke({"text": text, "max_length": max_length})),
+            timeout=REQUEST_TIMEOUT
+        )
+        return result.content if hasattr(result, 'content') else str(result)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=408, detail="Request timeout")
+    except Exception as e:
+        logger.error(f"Summarization error: {str(e)}")
+        raise
+
+async def process_text(text: str, llm, max_length: int) -> str:
+    """Process text with chunking and summarization."""
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="Empty text provided")
+        
+
+    chunks = chunk_text(text)
+    
+    if not chunks:
+        raise HTTPException(status_code=400, detail="No valid text chunks generated")
+    
+   
+    if len(chunks) == 1:
+        return await summarize_with_timeout(chunks[0], llm, max_length)
+    
+
+    summaries = []
+    chunk_length = max_length // len(chunks)
+    
+    for chunk in chunks:
+        for attempt in range(MAX_RETRIES):
+            try:
+                summary = await summarize_with_timeout(chunk, llm, chunk_length)
+                summaries.append(summary)
+                break
+            except Exception as e:
+                if attempt == MAX_RETRIES - 1:
+                    raise
+                await asyncio.sleep(1) 
+    
+   
+    if len(summaries) == 1:
+        return summaries[0]
+        
+    combined_text = "\n\n".join(summaries)
+    return await summarize_with_timeout(combined_text, llm, max_length)
+
 
 async def extract_text_from_pdf(file_bytes: bytes) -> str:
     try:
@@ -51,60 +153,50 @@ async def extract_text_from_txt(file_bytes: bytes) -> str:
     except UnicodeDecodeError:
         raise FileValidationError("Unable to decode text file")
 
-def get_file_type(filename: str, content_type: Optional[str]) -> str:
-    if content_type in SUPPORTED_FORMATS:
-        return content_type
-    ext = os.path.splitext(filename.lower())[1]
-    mime_type = mimetypes.types_map.get(ext)
-    if mime_type in SUPPORTED_FORMATS:
-        return mime_type
-    raise FileValidationError("Unsupported file format")
-
 async def process_file(file: UploadFile) -> str:
     if not file.filename:
         raise FileValidationError("No file provided")
-    file_type = get_file_type(file.filename, file.content_type)
+        
     content = await file.read()
     if not content:
         raise FileValidationError("Empty file provided")
-    if file_type.startswith('application/pdf'):
+        
+    if file.content_type.startswith('application/pdf'):
         return await extract_text_from_pdf(content)
-    elif 'wordprocessingml.document' in file_type or file_type == 'application/msword':
+    elif 'wordprocessingml.document' in file.content_type:
         return await extract_text_from_docx(content)
-    elif file_type == 'text/plain':
+    elif file.content_type == 'text/plain':
         return await extract_text_from_txt(content)
     else:
         raise FileValidationError("Unsupported file format")
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Loading summarization model...")
-    app.state.summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+    app.state.llm = ChatOpenAI(
+        temperature=0.7,
+        model="gpt-4o",
+        api_key=OPENAI_API_KEY,
+        timeout=REQUEST_TIMEOUT
+    )
     yield
     logger.info("Cleaning up resources...")
-    del app.state.summarizer
 
 app = FastAPI(lifespan=lifespan)
 
-
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"], 
-    allow_headers=["*"],  
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
-
-@app.exception_handler(FileValidationError)
-async def validation_exception_handler(request: Request, exc: FileValidationError):
-    return JSONResponse(status_code=400, content={"detail": exc.detail})
 
 class SummarizationRequest(BaseModel):
     text: str
     max_length: int = 150
     min_length: int = 30
-    do_sample: bool = False
 
 class SummarizationResponse(BaseModel):
     summary: str
@@ -114,63 +206,39 @@ class SummarizationResponse(BaseModel):
 
 @app.post("/summarize/", response_model=SummarizationResponse)
 async def summarize(request: SummarizationRequest):
-    if not request.text.strip():
-        raise HTTPException(status_code=400, detail="Input text cannot be empty")
-    result = app.state.summarizer(request.text, max_length=request.max_length, min_length=request.min_length, do_sample=request.do_sample, truncation=True)
-    return {"summary": result[0]['summary_text'], "model": "facebook/bart-large-cnn", "character_count": len(result[0]['summary_text'])}
-
-from transformers import BartTokenizer, BartForConditionalGeneration
-
-
-tokenizer = BartTokenizer.from_pretrained("facebook/bart-large-cnn")
-model = BartForConditionalGeneration.from_pretrained("facebook/bart-large-cnn")
-
-def truncate_text(text):
-    inputs = tokenizer(text, max_length=1022, truncation=True, return_tensors="pt")
-    return tokenizer.decode(inputs.input_ids[0], skip_special_tokens=True)
+    try:
+        summary = await process_text(request.text, app.state.llm, request.max_length)
+        return {
+            "summary": summary.strip(),
+            "model": "gpt-4o",
+            "character_count": len(summary.strip())
+        }
+    except Exception as e:
+        logger.error(f"Summarization error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/summarize/file/", response_model=SummarizationResponse)
 async def summarize_file(
     file: UploadFile = File(...),
-    max_length: int = 512,  
-    min_length: int = 100,   
-    do_sample: bool = False
+    max_length: int = 512,
+    min_length: int = 100
 ):
     try:
         text = await process_file(file)
-
-        if not text.strip():
-            raise FileValidationError("No text could be extracted from the file")
-
-        text = truncate_text(text)  
-
-        if len(text.split()) < 10:  
-            raise HTTPException(status_code=400, detail="Input text is too short for summarization")
-
-        
-        result = app.state.summarizer(
-            text,
-            max_length=min(max_length, 1024),  
-            min_length=min_length,
-            do_sample=do_sample,
-            truncation=True
-        )
-
+        summary = await process_text(text, app.state.llm, max_length)
         return {
-            "summary": result[0]['summary_text'],
-            "model": "facebook/bart-large-cnn",
-            "character_count": len(result[0]['summary_text']),
+            "summary": summary.strip(),
+            "model": "gpt-4o",
+            "character_count": len(summary.strip()),
             "original_filename": file.filename
         }
     except FileValidationError as e:
-        raise e
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"File summarization error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error processing your file: {str(e)}")
-
-from fastapi.middleware.cors import CORSMiddleware
-app.add_middleware(CORSMiddleware, allow_origins=[""], allow_methods=[""], allow_headers=["*"])
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
